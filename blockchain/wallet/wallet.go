@@ -142,6 +142,10 @@ func (w *Wallet) getImportKeyFlag() bool {
 	return false
 }
 
+func (w *Wallet) AttachBlock(block *legacy.Block) error {
+	return w.attachBlock(block)
+}
+
 func (w *Wallet) attachBlock(block *legacy.Block) error {
 	if block.PreviousBlockHash != w.status.WorkHash {
 		log.Warn("wallet skip attachBlock due to status hash not equal to previous hash")
