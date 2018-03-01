@@ -265,13 +265,14 @@ func (sw *Switch) AddPeer(peer *Peer) error {
 	if err := sw.peers.Add(peer); err != nil {
 		return err
 	}
+	// fmt.Println("====add peer remote address:", peer.mconn.RemoteAddress.IP.String())
 
-	key := fmt.Sprintf("peer_%s", peer.Addr())
-	fmt.Println("key:", key)
+	// key := fmt.Sprintf("peer_%s", peer.Addr())
+	// fmt.Println("key:", key)
 	tm := trust.NewMetric()
 
 	tm.Start()
-	sw.TrustMetricStore.AddPeerTrustMetric(key, tm)
+	sw.TrustMetricStore.AddPeerTrustMetric(peer.mconn.RemoteAddress.IP.String(), tm)
 
 	// key = fmt.Sprintf("peer_%d", 0)
 	// tm = trust.NewMetric()

@@ -246,7 +246,8 @@ func (bcr *BlockchainReactor) Receive(chID byte, src *p2p.Peer, msgBytes []byte)
 	fmt.Println("msg:", msg)
 	fmt.Println("tm size:", bcr.trustMetricStore.Size())
 	var tm *trust.TrustMetric
-	key := fmt.Sprintf("peer_%s", src.Addr())
+	// key := fmt.Sprintf("peer_%s", src.Addr())
+	key := src.Connection().RemoteAddress.IP.String()
 
 	if tm = bcr.trustMetricStore.GetPeerTrustMetric(key); tm != nil {
 		fmt.Println("tm value:", tm.TrustValue())
@@ -272,35 +273,35 @@ func (bcr *BlockchainReactor) Receive(chID byte, src *p2p.Peer, msgBytes []byte)
 			log.Errorf("Fail on BlockRequestMessage create resoinse: %v", err)
 			return
 		}
-		tm.GoodEvents(1)
+		// tm.GoodEvents(1)
 		src.TrySend(BlockchainChannel, struct{ BlockchainMessage }{response})
 
 	case *BlockResponseMessage:
-		// block := msg.GetBlock()
+		block := msg.GetBlock()
 		// preBlock, _ := bcr.chain.GetBlockByHash(&block.PreviousBlockHash)
-		// if err := bcr.chain.ValidateBlockBody(block); err != nil {
-		fmt.Println("====BlockResponseMessage:", err)
-		tm.BadEvents(1)
-		fmt.Println("value:", tm.TrustScore())
-		if tm.TrustScore() < 20 {
-			fmt.Println("==========Peer Disconnected")
-			bcr.sw.AddBannedPeer(src)
-			bcr.trustMetricStore.PeerDisconnected(key)
-			src.CloseConn()
+		if err := bcr.chain.ValidateBlockBody(block); err != nil {
+			fmt.Println("====BlockResponseMessage:", err)
+			tm.BadEvents(1)
+			fmt.Println("value:", tm.TrustScore())
+			if tm.TrustScore() < 20 {
+				fmt.Println("==========Peer Disconnected")
+				bcr.sw.AddBannedPeer(src)
+				bcr.trustMetricStore.PeerDisconnected(key)
+				src.CloseConn()
+			}
+		} else {
+			fmt.Println("====ValidateBlock OK")
 		}
-		// } else {
-		// 	fmt.Println("====ValidateBlock OK")
-		// }
 		bcr.blockKeeper.AddBlock(msg.GetBlock(), src.Key)
 
 	case *StatusRequestMessage:
-		tm.GoodEvents(1)
+		// tm.GoodEvents(1)
 		fmt.Println("value:", tm.TrustScore())
 		block := bcr.chain.BestBlock()
 		src.TrySend(BlockchainChannel, struct{ BlockchainMessage }{NewStatusResponseMessage(block)})
 
 	case *StatusResponseMessage:
-		tm.GoodEvents(1)
+		// tm.GoodEvents(1)
 		fmt.Println("value:", tm.TrustScore())
 
 		bcr.blockKeeper.SetPeerHeight(src.Key, msg.Height, msg.GetHash())
