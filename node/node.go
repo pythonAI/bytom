@@ -156,7 +156,9 @@ func NewNode(config *cfg.Config) *Node {
 		cmn.Exit(cmn.Fmt("Failed to start switch: %v", err))
 	}
 
-	sw := p2p.NewSwitch(config.P2P)
+	trustHistoryDB := dbm.NewDB("trusthistory", config.DBBackend, config.DBDir())
+
+	sw := p2p.NewSwitch(config.P2P, trustHistoryDB)
 
 	genesisBlock := cfg.GenerateGenesisBlock()
 
@@ -206,7 +208,7 @@ func NewNode(config *cfg.Config) *Node {
 		go accounts.ExpireReservations(ctx, expireReservationsPeriod)
 	}
 
-	bcReactor := bc.NewBlockchainReactor(chain, txPool, accounts, assets, sw, hsm, wallet, txFeed, accessTokens, config.Mining)
+	bcReactor := bc.NewBlockchainReactor(chain, txPool, accounts, assets, sw, hsm, wallet, txFeed, accessTokens, config.Mining, sw.TrustMetricStore)
 
 	sw.AddReactor("BLOCKCHAIN", bcReactor)
 

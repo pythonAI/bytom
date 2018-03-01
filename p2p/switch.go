@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -8,14 +9,19 @@ import (
 	"time"
 
 	cfg "github.com/bytom/config"
+	"github.com/bytom/p2p/trust"
 	log "github.com/sirupsen/logrus"
 	crypto "github.com/tendermint/go-crypto"
 	cmn "github.com/tendermint/tmlibs/common"
+	dbm "github.com/tendermint/tmlibs/db"
 )
 
 const (
 	reconnectAttempts = 30
 	reconnectInterval = 3 * time.Second
+
+	keyBannedPeer      = "BannedPeer"
+	defaultBanDuration = time.Hour * 24
 )
 
 type Reactor interface {
@@ -61,16 +67,19 @@ incoming messages are received on the reactor.
 type Switch struct {
 	cmn.BaseService
 
-	config       *cfg.P2PConfig
-	peerConfig   *PeerConfig
-	listeners    []Listener
-	reactors     map[string]Reactor
-	chDescs      []*ChannelDescriptor
-	reactorsByCh map[byte]Reactor
-	peers        *PeerSet
-	dialing      *cmn.CMap
-	nodeInfo     *NodeInfo             // our node info
-	nodePrivKey  crypto.PrivKeyEd25519 // our node privkey
+	config           *cfg.P2PConfig
+	peerConfig       *PeerConfig
+	listeners        []Listener
+	reactors         map[string]Reactor
+	chDescs          []*ChannelDescriptor
+	reactorsByCh     map[byte]Reactor
+	peers            *PeerSet
+	dialing          *cmn.CMap
+	nodeInfo         *NodeInfo             // our node info
+	nodePrivKey      crypto.PrivKeyEd25519 // our node privkey
+	TrustMetricStore *trust.TrustMetricStore
+	bannedPeer       map[string]time.Time
+	db               dbm.DB
 
 	filterConnByAddr   func(net.Addr) error
 	filterConnByPubKey func(crypto.PubKeyEd25519) error
@@ -80,7 +89,7 @@ var (
 	ErrSwitchDuplicatePeer = errors.New("Duplicate peer")
 )
 
-func NewSwitch(config *cfg.P2PConfig) *Switch {
+func NewSwitch(config *cfg.P2PConfig, trustHistoryDB dbm.DB) *Switch {
 	sw := &Switch{
 		config:       config,
 		peerConfig:   DefaultPeerConfig(config),
@@ -90,8 +99,25 @@ func NewSwitch(config *cfg.P2PConfig) *Switch {
 		peers:        NewPeerSet(),
 		dialing:      cmn.NewCMap(),
 		nodeInfo:     nil,
+		db:           trustHistoryDB,
 	}
 	sw.BaseService = *cmn.NewBaseService(nil, "P2P Switch", sw)
+	sw.TrustMetricStore = trust.NewTrustMetricStore(trustHistoryDB, trust.DefaultConfig())
+	sw.TrustMetricStore.Start()
+
+	sw.bannedPeer = make(map[string]time.Time)
+	if datajson := sw.db.Get([]byte(keyBannedPeer)); datajson != nil {
+		fmt.Println("====keyjson", datajson)
+		if err := json.Unmarshal(datajson, &sw.bannedPeer); err != nil {
+			fmt.Println("====new switch", err)
+			return nil
+		} else {
+			fmt.Println("====bannedPeer", sw.bannedPeer)
+		}
+	} else {
+		fmt.Println("====datajson is nil")
+	}
+
 	return sw
 }
 
@@ -199,6 +225,7 @@ func (sw *Switch) OnStop() {
 // NOTE: This performs a blocking handshake before the peer is added.
 // CONTRACT: If error is returned, peer is nil, and conn is immediately closed.
 func (sw *Switch) AddPeer(peer *Peer) error {
+	fmt.Println("======AddPeer")
 	if err := sw.FilterConnByAddr(peer.Addr()); err != nil {
 		return err
 	}
@@ -239,6 +266,21 @@ func (sw *Switch) AddPeer(peer *Peer) error {
 		return err
 	}
 
+	key := fmt.Sprintf("peer_%s", peer.Addr())
+	fmt.Println("key:", key)
+	tm := trust.NewMetric()
+
+	tm.Start()
+	sw.TrustMetricStore.AddPeerTrustMetric(key, tm)
+
+	// key = fmt.Sprintf("peer_%d", 0)
+	// tm = trust.NewMetric()
+
+	// tm.Start()
+	// sw.TrustMetricStore.AddPeerTrustMetric(key, tm)
+
+	fmt.Println("========trustMetricStore size", sw.TrustMetricStore.Size())
+
 	log.WithField("peer", peer).Info("Added peer")
 	return nil
 }
@@ -267,6 +309,7 @@ func (sw *Switch) SetPubKeyFilter(f func(crypto.PubKeyEd25519) error) {
 }
 
 func (sw *Switch) startInitPeer(peer *Peer) {
+	fmt.Println("=======startInitPeer")
 	peer.Start() // spawn send/recv routines
 	for _, reactor := range sw.reactors {
 		reactor.AddPeer(peer)
@@ -275,7 +318,7 @@ func (sw *Switch) startInitPeer(peer *Peer) {
 
 // Dial a list of seeds asynchronously in random order
 func (sw *Switch) DialSeeds(addrBook *AddrBook, seeds []string) error {
-
+	fmt.Println("====DialSeeds ", "addrBook:", addrBook.ourAddrs, addrBook.addrLookup, "seeds:", seeds)
 	netAddrs, err := NewNetAddressStrings(seeds)
 	if err != nil {
 		return err
@@ -308,15 +351,29 @@ func (sw *Switch) DialSeeds(addrBook *AddrBook, seeds []string) error {
 }
 
 func (sw *Switch) dialSeed(addr *NetAddress) {
+	fmt.Println("=======dialSeed")
 	peer, err := sw.DialPeerWithAddress(addr, true)
 	if err != nil {
+		fmt.Println("seed addr:", addr)
 		log.WithField("error", err).Error("Error dialing seed")
 	} else {
 		log.WithField("peer", peer).Info("Connected to seed")
 	}
 }
 
+var (
+	ErrConnectBannedPeer = errors.New("Connect banned peer")
+)
+
 func (sw *Switch) DialPeerWithAddress(addr *NetAddress, persistent bool) (*Peer, error) {
+	if banEnd, ok := sw.bannedPeer[addr.IP.String()]; ok {
+		fmt.Println("====DialPeerWithAddress banend", banEnd)
+		if time.Now().Before(banEnd) {
+			return nil, ErrConnectBannedPeer
+		}
+		sw.DelBannedPeer(addr.IP.String())
+	}
+
 	sw.dialing.Set(addr.IP.String(), addr)
 	defer sw.dialing.Delete(addr.IP.String())
 
@@ -456,6 +513,12 @@ func (sw *Switch) listenerRoutine(l Listener) {
 
 		// ignore connection if we already have enough
 		maxPeers := sw.config.MaxNumPeers
+		log.WithFields(log.Fields{
+			"address":  inConn.RemoteAddr().String(),
+			"numPeers": sw.peers.Size(),
+			"max":      maxPeers,
+		}).Info("====listenerRoutine")
+
 		if maxPeers <= sw.peers.Size() {
 			log.WithFields(log.Fields{
 				"address":  inConn.RemoteAddr().String(),
@@ -464,7 +527,7 @@ func (sw *Switch) listenerRoutine(l Listener) {
 			}).Info("Ignoring inbound connection: already have enough peers")
 			continue
 		}
-
+		fmt.Println("=====listenerRoutine")
 		// New inbound connection!
 		err := sw.addPeerWithConnectionAndConfig(inConn, sw.peerConfig)
 		if err != nil {
@@ -562,7 +625,7 @@ func makeSwitch(cfg *cfg.P2PConfig, i int, network, version string, initSwitch f
 	privKey := crypto.GenPrivKeyEd25519()
 	// new switch, add reactors
 	// TODO: let the config be passed in?
-	s := initSwitch(i, NewSwitch(cfg))
+	s := initSwitch(i, NewSwitch(cfg, nil))
 	s.SetNodeInfo(&NodeInfo{
 		PubKey:     privKey.PubKey().Unwrap().(crypto.PubKeyEd25519),
 		Moniker:    cmn.Fmt("switch%d", i),
@@ -576,6 +639,7 @@ func makeSwitch(cfg *cfg.P2PConfig, i int, network, version string, initSwitch f
 }
 
 func (sw *Switch) addPeerWithConnection(conn net.Conn) error {
+	fmt.Println("=======addPeerWithConnection")
 	peer, err := newInboundPeer(conn, sw.reactorsByCh, sw.chDescs, sw.StopPeerForError, sw.nodePrivKey, sw.config)
 	if err != nil {
 		conn.Close()
@@ -591,16 +655,42 @@ func (sw *Switch) addPeerWithConnection(conn net.Conn) error {
 }
 
 func (sw *Switch) addPeerWithConnectionAndConfig(conn net.Conn, config *PeerConfig) error {
+	fmt.Println("====addPeerWithConnectionAndConfig")
 	peer, err := newInboundPeerWithConfig(conn, sw.reactorsByCh, sw.chDescs, sw.StopPeerForError, sw.nodePrivKey, config)
 	if err != nil {
 		conn.Close()
 		return err
 	}
+	fmt.Println("addPeerWithConnectionAndConfig", conn.RemoteAddr())
 	peer.SetLogger(sw.Logger.With("peer", conn.RemoteAddr()))
 	if err = sw.AddPeer(peer); err != nil {
 		conn.Close()
 		return err
 	}
 
+	return nil
+}
+
+// NOTE: This performs a blocking handshake before the peer is added.
+// CONTRACT: If error is returned, peer is nil, and conn is immediately closed.
+func (sw *Switch) AddBannedPeer(peer *Peer) error {
+	// key := fmt.Sprintf("%s", peer.Addr())
+	key := peer.mconn.RemoteAddress.IP.String()
+	fmt.Println("====AddBannedPeer ip: ", key)
+	sw.bannedPeer[key] = time.Now().Add(defaultBanDuration)
+	datajson, _ := json.Marshal(sw.bannedPeer)
+	sw.db.Set([]byte(keyBannedPeer), datajson)
+	return nil
+}
+
+// NOTE: This performs a blocking handshake before the peer is added.
+// CONTRACT: If error is returned, peer is nil, and conn is immediately closed.
+func (sw *Switch) DelBannedPeer(addr string) error {
+	// key := fmt.Sprintf("%s", peer.Addr())
+	if _, ok := sw.bannedPeer[addr]; ok {
+		delete(sw.bannedPeer, addr)
+	}
+	datajson, _ := json.Marshal(sw.bannedPeer)
+	sw.db.Set([]byte(keyBannedPeer), datajson)
 	return nil
 }

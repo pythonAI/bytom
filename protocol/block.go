@@ -49,6 +49,20 @@ func (c *Chain) ValidateBlock(block, prev *legacy.Block) error {
 	if err := validation.ValidateBlock(blockEnts, prevEnts); err != nil {
 		return errors.Sub(ErrBadBlock, err)
 	}
+	if err := validation.ValidateBlockBody(blockEnts); err != nil {
+		return errors.Sub(ErrBadBlock, err)
+	}
+	return nil
+}
+
+// ValidateBlock validates an incoming block in advance of applying it
+// to a snapshot (with ApplyValidBlock) and committing it to the
+// blockchain (with CommitAppliedBlock).
+func (c *Chain) ValidateBlockBody(block *legacy.Block) error {
+	blockEnts := legacy.MapBlock(block)
+	if err := validation.ValidateBlockBody(blockEnts); err != nil {
+		return errors.Sub(ErrBadBlock, err)
+	}
 	return nil
 }
 

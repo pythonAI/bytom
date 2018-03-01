@@ -20,6 +20,7 @@ import (
 	"github.com/bytom/errors"
 	"github.com/bytom/mining/cpuminer"
 	"github.com/bytom/p2p"
+	"github.com/bytom/p2p/trust"
 	"github.com/bytom/protocol"
 	"github.com/bytom/protocol/bc/legacy"
 	"github.com/bytom/types"
@@ -64,21 +65,22 @@ func NewErrorResponse(err error) Response {
 type BlockchainReactor struct {
 	p2p.BaseReactor
 
-	chain         *protocol.Chain
-	wallet        *wallet.Wallet
-	accounts      *account.Manager
-	assets        *asset.Registry
-	accessTokens  *accesstoken.CredentialStore
-	txFeedTracker *txfeed.Tracker
-	blockKeeper   *blockKeeper
-	txPool        *protocol.TxPool
-	hsm           *pseudohsm.HSM
-	mining        *cpuminer.CPUMiner
-	mux           *http.ServeMux
-	sw            *p2p.Switch
-	handler       http.Handler
-	evsw          types.EventSwitch
-	miningEnable  bool
+	chain            *protocol.Chain
+	wallet           *wallet.Wallet
+	accounts         *account.Manager
+	assets           *asset.Registry
+	accessTokens     *accesstoken.CredentialStore
+	txFeedTracker    *txfeed.Tracker
+	blockKeeper      *blockKeeper
+	txPool           *protocol.TxPool
+	hsm              *pseudohsm.HSM
+	mining           *cpuminer.CPUMiner
+	mux              *http.ServeMux
+	sw               *p2p.Switch
+	handler          http.Handler
+	evsw             types.EventSwitch
+	miningEnable     bool
+	trustMetricStore *trust.TrustMetricStore
 }
 
 func batchRecover(ctx context.Context, v *interface{}) {
@@ -167,22 +169,23 @@ type page struct {
 }
 
 // NewBlockchainReactor returns the reactor of whole blockchain.
-func NewBlockchainReactor(chain *protocol.Chain, txPool *protocol.TxPool, accounts *account.Manager, assets *asset.Registry, sw *p2p.Switch, hsm *pseudohsm.HSM, wallet *wallet.Wallet, txfeeds *txfeed.Tracker, accessTokens *accesstoken.CredentialStore, miningEnable bool) *BlockchainReactor {
+func NewBlockchainReactor(chain *protocol.Chain, txPool *protocol.TxPool, accounts *account.Manager, assets *asset.Registry, sw *p2p.Switch, hsm *pseudohsm.HSM, wallet *wallet.Wallet, txfeeds *txfeed.Tracker, accessTokens *accesstoken.CredentialStore, miningEnable bool, trustMetricStore *trust.TrustMetricStore) *BlockchainReactor {
 	mining := cpuminer.NewCPUMiner(chain, accounts, txPool)
 	bcr := &BlockchainReactor{
-		chain:         chain,
-		wallet:        wallet,
-		accounts:      accounts,
-		assets:        assets,
-		blockKeeper:   newBlockKeeper(chain, sw),
-		txPool:        txPool,
-		mining:        mining,
-		mux:           http.NewServeMux(),
-		sw:            sw,
-		hsm:           hsm,
-		txFeedTracker: txfeeds,
-		accessTokens:  accessTokens,
-		miningEnable:  miningEnable,
+		chain:            chain,
+		wallet:           wallet,
+		accounts:         accounts,
+		assets:           assets,
+		blockKeeper:      newBlockKeeper(chain, sw),
+		txPool:           txPool,
+		mining:           mining,
+		mux:              http.NewServeMux(),
+		sw:               sw,
+		hsm:              hsm,
+		txFeedTracker:    txfeeds,
+		accessTokens:     accessTokens,
+		miningEnable:     miningEnable,
+		trustMetricStore: trustMetricStore,
 	}
 	bcr.BaseReactor = *p2p.NewBaseReactor("BlockchainReactor", bcr)
 	return bcr
@@ -238,7 +241,17 @@ func (bcr *BlockchainReactor) Receive(chID byte, src *p2p.Peer, msgBytes []byte)
 		return
 	}
 	log.WithFields(log.Fields{"peerID": src.Key, "msg": msg}).Info("Receive request")
+	fmt.Println("channel id:", chID)
+	fmt.Println("src:", src)
+	fmt.Println("msg:", msg)
+	fmt.Println("tm size:", bcr.trustMetricStore.Size())
+	var tm *trust.TrustMetric
+	key := fmt.Sprintf("peer_%s", src.Addr())
 
+	if tm = bcr.trustMetricStore.GetPeerTrustMetric(key); tm != nil {
+		fmt.Println("tm value:", tm.TrustValue())
+	}
+	// bcr.sw.BannedPeer = nil
 	switch msg := msg.(type) {
 	case *BlockRequestMessage:
 		var block *legacy.Block
@@ -249,6 +262,7 @@ func (bcr *BlockchainReactor) Receive(chID byte, src *p2p.Peer, msgBytes []byte)
 			block, err = bcr.chain.GetBlockByHash(msg.GetHash())
 		}
 		if err != nil {
+			tm.BadEvents(1)
 			log.Errorf("Fail on BlockRequestMessage get block: %v", err)
 			return
 		}
@@ -258,22 +272,51 @@ func (bcr *BlockchainReactor) Receive(chID byte, src *p2p.Peer, msgBytes []byte)
 			log.Errorf("Fail on BlockRequestMessage create resoinse: %v", err)
 			return
 		}
+		tm.GoodEvents(1)
 		src.TrySend(BlockchainChannel, struct{ BlockchainMessage }{response})
 
 	case *BlockResponseMessage:
+		// block := msg.GetBlock()
+		// preBlock, _ := bcr.chain.GetBlockByHash(&block.PreviousBlockHash)
+		// if err := bcr.chain.ValidateBlockBody(block); err != nil {
+		fmt.Println("====BlockResponseMessage:", err)
+		tm.BadEvents(1)
+		fmt.Println("value:", tm.TrustScore())
+		if tm.TrustScore() < 20 {
+			fmt.Println("==========Peer Disconnected")
+			bcr.sw.AddBannedPeer(src)
+			bcr.trustMetricStore.PeerDisconnected(key)
+			src.CloseConn()
+		}
+		// } else {
+		// 	fmt.Println("====ValidateBlock OK")
+		// }
 		bcr.blockKeeper.AddBlock(msg.GetBlock(), src.Key)
 
 	case *StatusRequestMessage:
+		tm.GoodEvents(1)
+		fmt.Println("value:", tm.TrustScore())
 		block := bcr.chain.BestBlock()
 		src.TrySend(BlockchainChannel, struct{ BlockchainMessage }{NewStatusResponseMessage(block)})
 
 	case *StatusResponseMessage:
+		tm.GoodEvents(1)
+		fmt.Println("value:", tm.TrustScore())
+
 		bcr.blockKeeper.SetPeerHeight(src.Key, msg.Height, msg.GetHash())
 
 	case *TransactionNotifyMessage:
 		tx := msg.GetTransaction()
 		if err := bcr.chain.ValidateTx(tx); err != nil {
 			log.Errorf("TransactionNotifyMessage: %v", err)
+			tm.BadEvents(1)
+			fmt.Println("value:", tm.TrustScore())
+			if tm.TrustScore() < 20 {
+				fmt.Println("==========Peer Disconnected")
+				bcr.sw.AddBannedPeer(src)
+				bcr.trustMetricStore.PeerDisconnected(key)
+				src.CloseConn()
+			}
 		}
 
 	default:
