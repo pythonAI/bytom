@@ -22,7 +22,7 @@ const (
 	reconnectInterval = 3 * time.Second
 
 	keyBannedPeer      = "BannedPeer"
-	defaultBanDuration = time.Hour * 24
+	defaultBanDuration = time.Minute * 1
 )
 
 type Reactor interface {
