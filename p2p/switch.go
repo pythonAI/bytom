@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"time"
 
 	cfg "github.com/bytom/config"
@@ -107,7 +108,6 @@ func NewSwitch(config *cfg.P2PConfig, trustHistoryDB dbm.DB) *Switch {
 
 	sw.bannedPeer = make(map[string]time.Time)
 	if datajson := sw.db.Get([]byte(keyBannedPeer)); datajson != nil {
-		fmt.Println("====keyjson", datajson)
 		if err := json.Unmarshal(datajson, &sw.bannedPeer); err != nil {
 			fmt.Println("====new switch", err)
 			return nil
@@ -656,7 +656,19 @@ func (sw *Switch) addPeerWithConnection(conn net.Conn) error {
 }
 
 func (sw *Switch) addPeerWithConnectionAndConfig(conn net.Conn, config *PeerConfig) error {
-	fmt.Println("====addPeerWithConnectionAndConfig")
+	fmt.Println("====inbound addPeerWithConnectionAndConfig")
+	fullAddr := conn.RemoteAddr().String()
+	for addr, banEnd := range sw.bannedPeer {
+		if strings.Contains(fullAddr, addr) {
+			fmt.Println("====PeerWithAddress banend: ", addr, banEnd)
+			if time.Now().Before(banEnd) {
+				return ErrConnectBannedPeer
+			}
+			sw.DelBannedPeer(addr)
+			break
+		}
+	}
+
 	peer, err := newInboundPeerWithConfig(conn, sw.reactorsByCh, sw.chDescs, sw.StopPeerForError, sw.nodePrivKey, config)
 	if err != nil {
 		conn.Close()
